@@ -12,7 +12,7 @@ RUN apt-get update \
     && apt-get -qq install graphviz aspell ghostscript libpspell-dev libpng-dev libicu-dev libxml2-dev libldap2-dev sudo netcat unzip libssl-dev zlib1g-dev libjpeg-dev libfreetype6-dev \
     && docker-php-ext-configure gd --with-freetype-dir --with-jpeg-dir \
     && docker-php-ext-install -j$(nproc) pspell gd intl xml xmlrpc ldap zip soap mbstring mysqli opcache \
-    && pecl install redis \
+    && pecl install redis-4.3.0 \
     && docker-php-ext-enable redis \
     && curl -L https://github.com/moodle/moodle/archive/v${MOODLE_VERSION}.tar.gz | tar xz --strip=1 \
     && curl -L https://moodle.org/plugins/download.php/19255/theme_fordson_moodle36_2019111003.zip -o /fordson.zip \
