@@ -64,6 +64,7 @@ require_once($CFG->dirroot.'/mod/lti/OAuth.php');
 require_once($CFG->libdir.'/weblib.php');
 require_once($CFG->dirroot . '/course/modlib.php');
 require_once($CFG->dirroot . '/mod/lti/TrivialStore.php');
+require_once($CFG->dirroot.'/user/profile/lib.php'); // ubc mod
 
 define('LTI_URL_DOMAIN_REGEX', '/(?:https?:\/\/)?(?:www\.)?([^\/]+)(?:\/|$)/i');
 
@@ -2099,6 +2100,17 @@ function lti_calculate_custom_parameter($value) {
             }
             $dt = new DateTime("@$COURSE->enddate", new DateTimeZone('UTC'));
             return $dt->format(DateTime::ATOM);
+        // ubc mod
+        case 'Person.ubc.puid':
+            profile_load_data($USER);
+            if (array_key_exists('puid', $USER->profile))
+                return $USER->profile['puid'];
+            return '';
+        case 'Person.ubc.cwl':
+            profile_load_data($USER);
+            if (array_key_exists('cwl', $USER->profile))
+                return $USER->profile['cwl'];
+            return '';
     }
     return null;
 }
@@ -3902,6 +3914,8 @@ function lti_get_capabilities() {
        'Person.phone.primary' => '$USER->phone1',
        'Person.phone.mobile' => '$USER->phone2',
        'Person.webaddress' => '$USER->url',
+       'Person.ubc.puid' => null, // ubc mod
+       'Person.ubc.cwl' => null, // ubc mod
        'Membership.role' => 'roles',
        'Result.sourcedId' => 'lis_result_sourcedid',
        'Result.autocreate' => 'lis_outcome_service_url',
