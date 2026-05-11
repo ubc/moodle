@@ -27,6 +27,10 @@ namespace ltiservice_memberships\local\service;
 
 defined('MOODLE_INTERNAL') || die();
 
+global $CFG; // ubc mod
+require_once($CFG->dirroot . '/mod/lti/locallib.php'); // ubc mod
+require_once($CFG->dirroot.'/user/profile/lib.php'); // ubc mod
+
 /**
  * A service implementing Memberships.
  *
@@ -461,6 +465,17 @@ class memberships extends \mod_lti\local\ltiservice\service_base {
                     $basicoutcome->lis_outcome_service_url = $serviceurl;
                     $message->{'https://purl.imsglobal.org/spec/lti-bo/claim/basicoutcome'} = $basicoutcome;
                 }
+                // ubc mod
+                $customParams = $this->getCustomParams($course, $user);
+                if (!empty($customParams)) {
+                    $customData = array();
+                    foreach ($customParams as $key => $val) {
+                        $customData[$key] = $val;
+                    }
+                    $message->{'https://purl.imsglobal.org/spec/lti/claim/custom'} =
+                        $customData;
+                }
+                // end ubc mod
                 $member->message = [$message];
             }
 
@@ -484,6 +499,59 @@ class memberships extends \mod_lti\local\ltiservice\service_base {
         $response->set_content_type('application/vnd.ims.lti-nrps.v2.membershipcontainer+json');
 
         return json_encode($arrusers);
+    }
+
+    // ubc mod
+    /**
+     * Add configured custom params to the NRPS results.
+     */
+    private function getCustomParams($course, $user) {
+        # prereqs for using /mod/lti/locallib.php to get our custom params
+        $tool = $this->get_type();
+        $islti2 = $tool->toolproxyid > 0;
+        $toolproxy = null;
+        if (isset($tool->toolproxyid)) {
+            $toolproxy = lti_get_tool_proxy($tool->toolproxyid);
+        }
+        # locallib uses the global USER and COURSE, and it's difficult to
+        # change, so I'm overriding the global USER and COURSE to be the ones
+        # we're actually using.
+        $prevGlobalUser = $GLOBALS['USER'];
+        $prevGlobalCourse = $GLOBALS['COURSE'];
+        $GLOBALS['USER'] = $user;
+        $GLOBALS['COURSE'] = $course;
+        # tried calling /mod/lti/locallib.php to populate these variable
+        # substitution values, but wasn't able to get that working, so
+        # reimplemented a subset of the available var subs here.
+        $paramsAvailable = array(
+            'context_id' => $course->id,
+            'context_title' => trim(html_to_text($course->fullname, 0)),
+            'context_label' => trim(html_to_text($course->shortname, 0)),
+            'lis_course_section_sourcedid' => $course->idnumber,
+            'user_id' => $user->id,
+            'lis_person_sourcedid' => $user->idnumber,
+            'lis_person_name_given' => $user->firstname,
+            'lis_person_name_family' => $user->lastname,
+            'lis_person_name_full' => fullname($user),
+            'ext_user_username' => $user->username,
+            'lis_person_contact_email_primary' => $user->email,
+        );
+        $customParams = lti_split_custom_parameters(
+            $toolproxy,
+            $tool,
+            $paramsAvailable,
+            $this->get_typeconfig()['customparameters'],
+            $islti2
+        );
+         $GLOBALS['USER'] = $prevGlobalUser;
+         $GLOBALS['COURSE'] = $prevGlobalCourse;
+        # lti_split_custom_parameters() put the prefix custom_ in front our
+        # param keys, so remove them for return
+        $ret = array();
+        foreach ($customParams as $key => $val) {
+            $ret[substr($key, strlen('custom_'))] = $val;
+        }
+        return $ret;
     }
 
     /**

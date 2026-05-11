@@ -2103,13 +2103,13 @@ function lti_calculate_custom_parameter($value) {
         // ubc mod
         case 'Person.ubc.puid':
             profile_load_data($USER);
-            if (array_key_exists('puid', $USER->profile))
-                return $USER->profile['puid'];
+            if (isset($USER->profile_field_puid))
+                return $USER->profile_field_puid;
             return '';
         case 'Person.ubc.cwl':
             profile_load_data($USER);
-            if (array_key_exists('cwl', $USER->profile))
-                return $USER->profile['cwl'];
+            if (isset($USER->profile_field_cwl))
+                return $USER->profile_field_cwl;
             return '';
     }
     return null;
