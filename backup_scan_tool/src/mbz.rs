@@ -30,6 +30,11 @@ pub struct TarGzBacked {
     path: PathBuf,
     names: Vec<String>,
     /// XML entry contents, eagerly captured during the single tar pass.
+    ///
+    /// TODO(scale): for multi-GB backups, holding every XML in a `HashMap`
+    /// can OOM. A streaming refactor (validators consume `impl Read` once,
+    /// driven by the tar iteration) would fix it but reshapes every
+    /// validator's signature — left for a future phase.
     xml: HashMap<String, Vec<u8>>,
 }
 

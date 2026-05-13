@@ -6,6 +6,7 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use super::codes;
 use super::Issue;
 
 pub fn check(xml_name: &str, bytes: &[u8]) -> Option<Issue> {
@@ -18,6 +19,7 @@ pub fn check(xml_name: &str, bytes: &[u8]) -> Option<Issue> {
             Ok(_) => {}
             Err(e) => {
                 return Some(Issue::error(
+                    codes::XML_PARSE,
                     xml_name,
                     format!("byte {}", reader.buffer_position()),
                     format!("XML parse error: {}", e),

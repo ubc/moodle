@@ -22,11 +22,12 @@
 //!   constraint. If the name isn't a field, we emit a warning (unknown
 //!   leaf), promoted to error under `--strict`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use super::codes;
 use super::{Issue, Severity};
 use crate::schema::{Field, FieldType, Schema, Table};
 use crate::transformer;
@@ -84,6 +85,7 @@ pub fn check(
         path: Vec::new(),
         ctx_stack: Vec::new(),
         deferred: Vec::new(),
+        unique_seen: HashMap::new(),
     };
     walker.run(bytes);
     walker.issues
@@ -101,6 +103,10 @@ struct Walker<'s> {
     /// Stack of direct-child elements of a row whose final classification
     /// (field vs wrapper) is pending. Closed in LIFO order with their element.
     deferred: Vec<DeferredChild<'s>>,
+    /// Tracks tuples of values per (table, unique-key-name) for within-XML
+    /// UNIQUE-constraint detection. Key = (table_lower, keyname_lower);
+    /// value = set of "v1\u{1f}v2..." composite tuples already observed.
+    unique_seen: HashMap<(String, String), HashSet<String>>,
 }
 
 struct TableContext<'s> {
@@ -109,6 +115,12 @@ struct TableContext<'s> {
     open_depth: usize,
     /// Field names we've already validated, to deduplicate per-row.
     seen_fields: HashSet<String>,
+    /// Field-name -> value (raw text) collected during this row. Used for
+    /// unique-key projection at end-of-row.
+    field_values: HashMap<String, String>,
+    /// Location string for the row's opening element, for unique-violation
+    /// issues.
+    row_location: String,
 }
 
 struct DeferredChild<'s> {
@@ -130,13 +142,13 @@ impl<'s> Walker<'s> {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) => {
                     let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                    let has_id = has_id_attribute(&e);
-                    self.on_start(&name, has_id);
+                    let id_value = id_attribute_value(&e);
+                    self.on_start(&name, id_value);
                 }
                 Ok(Event::Empty(e)) => {
                     let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                    let has_id = has_id_attribute(&e);
-                    self.on_start(&name, has_id);
+                    let id_value = id_attribute_value(&e);
+                    self.on_start(&name, id_value);
                     self.on_end();
                 }
                 Ok(Event::Text(t)) => {
@@ -164,7 +176,7 @@ impl<'s> Walker<'s> {
         s
     }
 
-    fn on_start(&mut self, name: &str, has_id: bool) {
+    fn on_start(&mut self, name: &str, id_value: Option<String>) {
         self.path.push(name.to_string());
         let depth = self.path.len();
         let lower = name.to_ascii_lowercase();
@@ -208,12 +220,21 @@ impl<'s> Walker<'s> {
 
         // Not under a row. Is this element itself a row? Only if its name
         // matches a table AND it carries an `id` attribute.
-        if has_id {
+        if let Some(id_str) = id_value {
             if let Some(table) = self.schema.table(&lower) {
+                let row_location = self.current_location();
+                let mut field_values = HashMap::new();
+                // Seed the row's `id` column from the attribute so unique
+                // keys involving `id` (e.g. PRIMARY KEY) work.
+                if table.fields.contains_key("id") {
+                    field_values.insert("id".to_string(), id_str);
+                }
                 self.ctx_stack.push(TableContext {
                     table,
                     open_depth: depth,
                     seen_fields: HashSet::new(),
+                    field_values,
+                    row_location,
                 });
             }
         }
@@ -238,14 +259,70 @@ impl<'s> Walker<'s> {
             }
         }
 
-        // Close table-row context if its depth matches.
+        // Close table-row context if its depth matches. Project unique keys
+        // before popping so we can emit row-level uniqueness issues.
         if let Some(ctx) = self.ctx_stack.last() {
             if ctx.open_depth == depth {
+                self.check_unique_keys_for_top_row();
                 self.ctx_stack.pop();
             }
         }
 
         self.path.pop();
+    }
+
+    /// At the moment a row closes, project each of its table's UNIQUE keys
+    /// onto the collected field values; if every field in a key has a value,
+    /// build a composite tuple and check it against the per-XML `unique_seen`
+    /// tracker for that (table, key) pair.
+    fn check_unique_keys_for_top_row(&mut self) {
+        // Extract context data we need (clone the small bits to avoid double
+        // borrow of self).
+        let ctx = self.ctx_stack.last().expect("caller ensures non-empty");
+        if ctx.table.unique_keys.is_empty() {
+            return;
+        }
+        let table_name = ctx.table.name.to_ascii_lowercase();
+        let row_location = ctx.row_location.clone();
+        let values = ctx.field_values.clone();
+        let keys = ctx.table.unique_keys.clone();
+
+        for key in &keys {
+            // Skip if any field of the key is missing from this row's
+            // captured values. Backup XML is a subset of row columns; partial
+            // keys would yield false positives.
+            let mut tuple_parts: Vec<&str> = Vec::with_capacity(key.fields.len());
+            let mut complete = true;
+            for f in &key.fields {
+                match values.get(f) {
+                    Some(v) => tuple_parts.push(v.as_str()),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if !complete {
+                continue;
+            }
+            let tuple = tuple_parts.join("\u{1f}");
+            let map_key = (table_name.clone(), key.name.to_ascii_lowercase());
+            let entry = self.unique_seen.entry(map_key).or_default();
+            if !entry.insert(tuple.clone()) {
+                let fields_disp = key.fields.join(",");
+                self.issues.push(Issue::error(
+                    codes::STRUCT_UNIQUE_VIOLATION,
+                    self.xml_file.clone(),
+                    row_location.clone(),
+                    format!(
+                        "duplicate row for UNIQUE/PRIMARY key {:?} on table {} (fields=[{}], value={:?})",
+                        key.name, table_name, fields_disp, tuple_parts.join(",")
+                    ),
+                ));
+                // Only emit once per row per key.
+                break;
+            }
+        }
     }
 
     fn finalize_deferred(&mut self, d: DeferredChild<'s>) {
@@ -255,9 +332,12 @@ impl<'s> Walker<'s> {
         }
         match d.field {
             Some(field) => {
-                // Track that this field was seen for the current row.
+                // Track that this field was seen for the current row, and
+                // record its value (trimmed) for unique-key projection.
                 if let Some(ctx) = self.ctx_stack.last_mut() {
-                    ctx.seen_fields.insert(field.name.to_ascii_lowercase());
+                    let lower = field.name.to_ascii_lowercase();
+                    ctx.seen_fields.insert(lower.clone());
+                    ctx.field_values.insert(lower, d.text_buf.trim().to_string());
                 }
                 self.validate_field_value(field, &d.text_buf, &d.location);
             }
@@ -292,6 +372,7 @@ impl<'s> Walker<'s> {
             None => {
                 if field.notnull {
                     self.issues.push(Issue::error(
+                        codes::STRUCT_NOTNULL_VIOLATION,
                         self.xml_file.clone(),
                         location.to_string(),
                         format!(
@@ -317,6 +398,7 @@ impl<'s> Walker<'s> {
             let actual = transformer::char_len(raw);
             if actual as u32 > max {
                 self.issues.push(Issue::error(
+                    codes::STRUCT_CHAR_OVERFLOW,
                     self.xml_file.clone(),
                     location.to_string(),
                     format!(
@@ -334,6 +416,7 @@ impl<'s> Walker<'s> {
         }
         if value.parse::<i64>().is_err() {
             self.issues.push(Issue::error(
+                codes::STRUCT_INT_INVALID,
                 self.xml_file.clone(),
                 location.to_string(),
                 format!(
@@ -347,6 +430,7 @@ impl<'s> Walker<'s> {
             let digits = value.trim_start_matches('-').chars().count() as u32;
             if digits > max_digits {
                 self.issues.push(Issue::error(
+                    codes::STRUCT_INT_OVERFLOW,
                     self.xml_file.clone(),
                     location.to_string(),
                     format!(
@@ -364,6 +448,7 @@ impl<'s> Walker<'s> {
         }
         if value.parse::<f64>().is_err() {
             self.issues.push(Issue::error(
+                codes::STRUCT_NUMBER_INVALID,
                 self.xml_file.clone(),
                 location.to_string(),
                 format!(
@@ -384,6 +469,7 @@ impl<'s> Walker<'s> {
         if let Some(p) = field.length {
             if total_digits > p {
                 self.issues.push(Issue::error(
+                    codes::STRUCT_NUMBER_PRECISION,
                     self.xml_file.clone(),
                     location.to_string(),
                     format!(
@@ -396,6 +482,7 @@ impl<'s> Walker<'s> {
         if let Some(d) = field.decimals {
             if frac_digits > d {
                 self.issues.push(Issue::error(
+                    codes::STRUCT_NUMBER_DECIMALS,
                     self.xml_file.clone(),
                     location.to_string(),
                     format!(
@@ -413,6 +500,7 @@ impl<'s> Walker<'s> {
         }
         if value.parse::<f64>().is_err() {
             self.issues.push(Issue::error(
+                codes::STRUCT_FLOAT_INVALID,
                 self.xml_file.clone(),
                 location.to_string(),
                 format!(
@@ -431,6 +519,7 @@ impl<'s> Walker<'s> {
         };
         self.issues.push(Issue {
             severity,
+            code: codes::STRUCT_UNKNOWN_LEAF,
             xml_file: self.xml_file.clone(),
             location: location.to_string(),
             message: msg,
@@ -438,13 +527,14 @@ impl<'s> Walker<'s> {
     }
 }
 
-fn has_id_attribute(e: &quick_xml::events::BytesStart) -> bool {
+fn id_attribute_value(e: &quick_xml::events::BytesStart) -> Option<String> {
     for attr in e.attributes().flatten() {
         if attr.key.as_ref().eq_ignore_ascii_case(b"id") {
-            return true;
+            let s = String::from_utf8_lossy(&attr.value).into_owned();
+            return Some(s);
         }
     }
-    false
+    None
 }
 
 #[cfg(test)]
@@ -523,6 +613,7 @@ mod tests {
                 fields,
                 plugin_path: "mod/widget".to_string(),
                 aliases: HashMap::new(),
+                unique_keys: Vec::new(),
             },
         );
         Schema { tables }
@@ -678,6 +769,84 @@ mod tests {
             "numsections should be silenced by allowlist: {:?}",
             issues
         );
+    }
+
+    #[test]
+    fn primary_key_duplicate_id_is_detected() {
+        // Build a schema with a PRIMARY KEY on id.
+        let mut s = sample_schema();
+        s.tables.get_mut("widget").unwrap().unique_keys.push(
+            crate::xmldb_shared::UniqueKey {
+                name: "primary".to_string(),
+                fields: vec!["id".to_string()],
+            },
+        );
+        let xml = r#"<root>
+            <widget id="1"><name>a</name></widget>
+            <widget id="1"><name>b</name></widget>
+        </root>"#;
+        let issues = check("test.xml", xml.as_bytes(), &s, &StructureOptions::default());
+        assert!(
+            issues.iter().any(|i| i.code == codes::STRUCT_UNIQUE_VIOLATION
+                && i.message.contains("primary")),
+            "expected unique violation, got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn unique_key_with_missing_field_is_silently_skipped() {
+        // Composite UNIQUE on (id, name); rows have id but not name.
+        // We must NOT report a false positive — partial keys can't be checked.
+        let mut s = sample_schema();
+        s.tables.get_mut("widget").unwrap().unique_keys.push(
+            crate::xmldb_shared::UniqueKey {
+                name: "idname_uq".to_string(),
+                fields: vec!["id".to_string(), "name".to_string()],
+            },
+        );
+        let xml = r#"<root>
+            <widget id="1"><count>1</count></widget>
+            <widget id="1"><count>2</count></widget>
+        </root>"#;
+        let issues = check("test.xml", xml.as_bytes(), &s, &StructureOptions::default());
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.code == codes::STRUCT_UNIQUE_VIOLATION),
+            "expected NO unique violation (incomplete key), got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn composite_unique_key_distinguishes_distinct_tuples() {
+        // UNIQUE on (id, name); two rows differ in name -> no violation.
+        // Two rows match -> violation.
+        let mut s = sample_schema();
+        s.tables.get_mut("widget").unwrap().unique_keys.push(
+            crate::xmldb_shared::UniqueKey {
+                name: "idname_uq".to_string(),
+                fields: vec!["id".to_string(), "name".to_string()],
+            },
+        );
+        let xml = r#"<root>
+            <widget id="1"><name>a</name></widget>
+            <widget id="1"><name>b</name></widget>
+            <widget id="1"><name>a</name></widget>
+        </root>"#;
+        let issues = check("test.xml", xml.as_bytes(), &s, &StructureOptions::default());
+        let violations: Vec<&Issue> = issues
+            .iter()
+            .filter(|i| i.code == codes::STRUCT_UNIQUE_VIOLATION)
+            .collect();
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected exactly one violation, got: {:?}",
+            violations
+        );
+        assert!(violations[0].message.contains("idname_uq"));
     }
 
     #[test]

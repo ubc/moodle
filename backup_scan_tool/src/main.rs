@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 use backup_scan_tool::report::{MbzResult, Report};
 use backup_scan_tool::{scanner, schema};
 
-use crate::cli::Cli;
+use crate::cli::{Cli, OutputFormat};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -57,8 +57,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let color = out.is_terminal();
-    report.print_text(&mut out, color, cli.quiet)?;
+    match cli.format {
+        OutputFormat::Text => {
+            let color = out.is_terminal();
+            report.print_text(&mut out, color, cli.quiet, cli.max_issues_per_code)?;
+        }
+        OutputFormat::Json => {
+            report.print_json(&mut out)?;
+        }
+        OutputFormat::Sarif => {
+            report.print_sarif(&mut out)?;
+        }
+    }
     let _ = out.flush();
 
     let errors = report.total_errors() + report.fatal_count();

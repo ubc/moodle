@@ -50,6 +50,14 @@ pub struct Field {
     pub default: Option<String>,
 }
 
+/// A UNIQUE (or PRIMARY) key declared in install.xml. Field names are
+/// lowercased to match `Table::fields` keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UniqueKey {
+    pub name: String,
+    pub fields: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
     pub name: String,
@@ -61,6 +69,10 @@ pub struct Table {
     /// stored lowercase. Populated at build time by parsing stepslib PHP.
     #[serde(default)]
     pub aliases: HashMap<String, String>,
+    /// UNIQUE and PRIMARY keys from install.xml's <KEYS> section.
+    /// Used by the structure validator to detect within-XML duplicates.
+    #[serde(default)]
+    pub unique_keys: Vec<UniqueKey>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -123,9 +135,13 @@ impl Schema {
 
 /// Parse a Moodle install.xml byte buffer and return its tables.
 ///
-/// We only extract <TABLE NAME=...><FIELDS><FIELD .../></FIELDS></TABLE>. Keys,
-/// indexes, statistics, etc. are ignored — they don't affect backup XML
-/// validation.
+/// We extract:
+///   <TABLE NAME=…> ...
+///     <FIELDS> <FIELD .../> ... </FIELDS>
+///     <KEYS>   <KEY TYPE="unique"|"primary" FIELDS="a,b" .../> ... </KEYS>
+///
+/// Other XMLDB elements (INDEXES, STATISTICS, foreign KEYs) are ignored —
+/// they don't materially affect backup XML validation.
 pub fn parse_install_xml(bytes: &[u8]) -> Result<Vec<Table>, String> {
     let mut reader = Reader::from_reader(bytes);
     reader.config_mut().trim_text(true);
@@ -133,6 +149,7 @@ pub fn parse_install_xml(bytes: &[u8]) -> Result<Vec<Table>, String> {
     let mut tables: Vec<Table> = Vec::new();
     let mut current_table: Option<Table> = None;
     let mut in_fields = false;
+    let mut in_keys = false;
     let mut buf = Vec::new();
 
     loop {
@@ -145,10 +162,14 @@ pub fn parse_install_xml(bytes: &[u8]) -> Result<Vec<Table>, String> {
                         fields: HashMap::new(),
                         plugin_path: String::new(),
                         aliases: HashMap::new(),
+                        unique_keys: Vec::new(),
                     });
                 }
                 b"FIELDS" => {
                     in_fields = true;
+                }
+                b"KEYS" => {
+                    in_keys = true;
                 }
                 _ => {}
             },
@@ -163,6 +184,9 @@ pub fn parse_install_xml(bytes: &[u8]) -> Result<Vec<Table>, String> {
                 b"FIELDS" => {
                     in_fields = false;
                 }
+                b"KEYS" => {
+                    in_keys = false;
+                }
                 _ => {}
             },
             Ok(Event::Empty(e)) => {
@@ -170,6 +194,12 @@ pub fn parse_install_xml(bytes: &[u8]) -> Result<Vec<Table>, String> {
                     if let Some(field) = parse_field(&e) {
                         if let Some(t) = current_table.as_mut() {
                             t.fields.insert(field.name.to_ascii_lowercase(), field);
+                        }
+                    }
+                } else if in_keys && e.name().as_ref() == b"KEY" {
+                    if let Some(key) = parse_unique_key(&e) {
+                        if let Some(t) = current_table.as_mut() {
+                            t.unique_keys.push(key);
                         }
                     }
                 }
@@ -188,6 +218,26 @@ pub fn parse_install_xml(bytes: &[u8]) -> Result<Vec<Table>, String> {
     }
 
     Ok(tables)
+}
+
+/// Parse a <KEY> element and return a UniqueKey IFF its TYPE is unique or
+/// primary. Returns None for foreign / non-unique keys.
+fn parse_unique_key(e: &quick_xml::events::BytesStart) -> Option<UniqueKey> {
+    let ty = read_attr(e, b"TYPE")?.to_ascii_lowercase();
+    if !matches!(ty.as_str(), "unique" | "primary") {
+        return None;
+    }
+    let name = read_attr(e, b"NAME").unwrap_or_default();
+    let fields_attr = read_attr(e, b"FIELDS")?;
+    let fields: Vec<String> = fields_attr
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if fields.is_empty() {
+        return None;
+    }
+    Some(UniqueKey { name, fields })
 }
 
 fn parse_field(e: &quick_xml::events::BytesStart) -> Option<Field> {

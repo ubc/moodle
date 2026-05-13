@@ -11,7 +11,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use crate::mbz::MbzArchive;
-use crate::validate::Issue;
+use crate::validate::{codes, Issue};
 
 pub fn check_moodle_backup_manifest(
     archive: &MbzArchive,
@@ -33,6 +33,7 @@ pub fn check_moodle_backup_manifest(
         let has_any_child = entry_names.iter().any(|n| n.starts_with(&prefix));
         if !has_any_child {
             issues.push(Issue::error(
+                codes::MANIFEST_MISSING_DIR,
                 "moodle_backup.xml",
                 format!("/moodle_backup/.../directory={}", dir),
                 format!(
@@ -137,7 +138,12 @@ pub fn check_files_xml(archive: &MbzArchive, xml_bytes: &[u8]) -> Vec<Issue> {
                 missing
             ),
         };
-        issues.push(Issue::error("files.xml", "/files".to_string(), detail));
+        issues.push(Issue::error(
+            codes::MANIFEST_MISSING_FILE_PAYLOAD,
+            "files.xml",
+            "/files".to_string(),
+            detail,
+        ));
     }
 
     issues

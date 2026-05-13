@@ -96,6 +96,7 @@ dependencies = [
  "rayon",
  "regex",
  "serde",
+ "serde_json",
  "tar",
  "tempfile",
  "thiserror 1.0.69",

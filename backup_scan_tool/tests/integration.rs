@@ -28,7 +28,11 @@ fn make_mbz(dir: &TempDir, name: &str, files: &[(&str, &[u8])]) -> std::path::Pa
 }
 
 #[test]
-fn well_formed_minimal_mbz_passes() {
+fn well_formed_minimal_mbz_has_no_parse_errors() {
+    // Synthetic minimal archive: just moodle_backup.xml. Shape/completeness
+    // will flag missing root files (expected — that check is exercised
+    // separately). Here we assert ONLY that parsing succeeded — no
+    // MBZ-XML-PARSE issues.
     let dir = TempDir::new().unwrap();
     let path = make_mbz(
         &dir,
@@ -41,7 +45,11 @@ fn well_formed_minimal_mbz_passes() {
     let s = schema::schema();
     let result = scanner::scan_mbz(&path, &s, false);
     assert!(result.fatal.is_none());
-    assert_eq!(result.errors(), 0, "{:?}", result.issues);
+    assert!(
+        !result.issues.iter().any(|i| i.code == "MBZ-XML-PARSE"),
+        "unexpected parse errors: {:?}",
+        result.issues
+    );
 }
 
 #[test]
@@ -113,6 +121,233 @@ fn manifest_directory_missing_in_zip_reports() {
         .issues
         .iter()
         .any(|i| i.message.contains("activities/assign_99")));
+}
+
+#[test]
+fn inforef_dangling_user_reference_is_detected() {
+    // users.xml has user id=1; activities/assign_5/inforef.xml references user id=99.
+    // Expect MBZ-XREF-MISSING-USER on the inforef path.
+    let users_xml = r#"<?xml version="1.0"?><users>
+        <user id="1"><username>a</username></user>
+    </users>"#;
+    let inforef_xml = r#"<?xml version="1.0"?><inforef>
+        <userref>
+            <user><id>1</id></user>
+            <user><id>99</id></user>
+        </userref>
+    </inforef>"#;
+
+    let dir = TempDir::new().unwrap();
+    let path = make_mbz(
+        &dir,
+        "xref.mbz",
+        &[
+            ("users.xml", users_xml.as_bytes()),
+            ("activities/assign_5/inforef.xml", inforef_xml.as_bytes()),
+        ],
+    );
+    let s = schema::schema();
+    let result = scanner::scan_mbz(&path, &s, false);
+    let xref = result
+        .issues
+        .iter()
+        .find(|i| i.code == "MBZ-XREF-MISSING-USER")
+        .expect("expected XREF-MISSING-USER");
+    assert_eq!(xref.xml_file, "activities/assign_5/inforef.xml");
+    assert!(xref.message.contains("99"), "msg: {}", xref.message);
+}
+
+#[test]
+fn inforef_silent_when_source_xml_absent() {
+    // No users.xml in archive. Inforef references a user id but we should
+    // NOT report it — Phase 3 will flag the missing top-level file.
+    let inforef_xml = r#"<?xml version="1.0"?><inforef>
+        <userref><user><id>1</id></user></userref>
+    </inforef>"#;
+    let dir = TempDir::new().unwrap();
+    let path = make_mbz(
+        &dir,
+        "xref_silent.mbz",
+        &[("activities/assign_5/inforef.xml", inforef_xml.as_bytes())],
+    );
+    let s = schema::schema();
+    let result = scanner::scan_mbz(&path, &s, false);
+    assert!(
+        !result
+            .issues
+            .iter()
+            .any(|i| i.code.starts_with("MBZ-XREF-MISSING")),
+        "expected no xref issues, got: {:?}",
+        result.issues
+    );
+}
+
+#[test]
+fn shape_missing_activity_file_is_reported() {
+    // Manifest declares activities/assign_5 but the archive lacks module.xml.
+    let backup_xml = r#"<?xml version="1.0"?><moodle_backup><information>
+        <contents>
+          <activities>
+            <activity>
+              <moduleid>1</moduleid>
+              <modulename>assign</modulename>
+              <title>x</title>
+              <directory>activities/assign_5</directory>
+            </activity>
+          </activities>
+        </contents>
+    </information></moodle_backup>"#;
+
+    let dir = TempDir::new().unwrap();
+    let path = make_mbz(
+        &dir,
+        "shape.mbz",
+        &[
+            ("moodle_backup.xml", backup_xml.as_bytes()),
+            // Provide inforef.xml only — module/roles/grades/grading/competencies missing.
+            (
+                "activities/assign_5/inforef.xml",
+                br#"<?xml version="1.0"?><inforef></inforef>"# as &[u8],
+            ),
+        ],
+    );
+    let s = schema::schema();
+    let result = scanner::scan_mbz(&path, &s, false);
+    let missing: Vec<_> = result
+        .issues
+        .iter()
+        .filter(|i| i.code == "MBZ-SHAPE-MISSING-ACTIVITY-FILE")
+        .collect();
+    assert!(
+        missing
+            .iter()
+            .any(|i| i.message.contains("module.xml") && i.message.contains("assign_5")),
+        "expected module.xml missing for assign_5, got: {:?}",
+        missing
+    );
+}
+
+#[test]
+fn shape_missing_users_xml_when_setting_enabled() {
+    // Root setting users=1 but no users.xml in the archive.
+    let backup_xml = r#"<?xml version="1.0"?><moodle_backup><information>
+        <settings>
+          <setting>
+            <level>root</level>
+            <name>users</name>
+            <value>1</value>
+          </setting>
+        </settings>
+    </information></moodle_backup>"#;
+
+    let dir = TempDir::new().unwrap();
+    let path = make_mbz(
+        &dir,
+        "users.mbz",
+        &[("moodle_backup.xml", backup_xml.as_bytes())],
+    );
+    let s = schema::schema();
+    let result = scanner::scan_mbz(&path, &s, false);
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|i| i.code == "MBZ-SHAPE-MISSING-ROOT-FILE"
+                && i.message.contains("users.xml")
+                && i.message.contains("users=1")),
+        "expected users.xml gated-missing issue, got: {:?}",
+        result.issues
+    );
+}
+
+#[test]
+fn orphan_file_payload_in_zip_is_warned() {
+    // files.xml references no payloads, but the zip has a files/aa/aa…aa entry.
+    let files_xml = r#"<?xml version="1.0"?><files></files>"#;
+    let orphan_name = "files/aa/aabbccddeeff00112233445566778899aabbccdd";
+    let dir = TempDir::new().unwrap();
+    let path = make_mbz(
+        &dir,
+        "orphan.mbz",
+        &[
+            ("files.xml", files_xml.as_bytes()),
+            (orphan_name, b"binary payload bytes"),
+        ],
+    );
+    let s = schema::schema();
+    let result = scanner::scan_mbz(&path, &s, false);
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|i| i.code == "MBZ-ORPHAN-FILE-PAYLOAD"),
+        "expected orphan payload warning, got: {:?}",
+        result.issues
+    );
+}
+
+#[test]
+fn unsafe_archive_entry_name_is_flagged() {
+    let dir = TempDir::new().unwrap();
+    let path = make_mbz(
+        &dir,
+        "evil.mbz",
+        &[
+            (
+                "moodle_backup.xml",
+                br#"<?xml version="1.0"?><moodle_backup></moodle_backup>"# as &[u8],
+            ),
+            ("../../../etc/passwd", b"hostile"),
+        ],
+    );
+    let s = schema::schema();
+    let result = scanner::scan_mbz(&path, &s, false);
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|i| i.code == "MBZ-SAFETY-PATH-TRAVERSAL"),
+        "expected path traversal flag, got: {:?}",
+        result.issues
+    );
+}
+
+#[test]
+fn many_char_overflows_cap_in_text_output() {
+    use backup_scan_tool::report::{MbzResult, Report};
+    use backup_scan_tool::validate::{codes, Issue};
+    use std::path::PathBuf;
+
+    // Synthesize a report with 200 same-code issues, render at default cap (5).
+    let issues: Vec<Issue> = (0..200)
+        .map(|i| {
+            Issue::error(
+                codes::STRUCT_CHAR_OVERFLOW,
+                "course/course.xml",
+                format!("/course/row[{}]/fullname", i),
+                format!("char field <fullname> length 300 exceeds LENGTH=\"254\" (row {})", i),
+            )
+        })
+        .collect();
+    let r = Report {
+        results: vec![MbzResult {
+            path: PathBuf::from("/tmp/big.mbz"),
+            xml_count: 1,
+            fatal: None,
+            issues,
+        }],
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    r.print_text(&mut buf, false, false, 5).unwrap();
+    let s = String::from_utf8(buf).unwrap();
+    // 5 verbatim ERROR lines plus one summary line.
+    let verbatim = s.matches("[ERROR] [MBZ-STRUCT-CHAR-OVERFLOW] course/course.xml:/course/row[").count();
+    assert_eq!(verbatim, 5, "expected 5 verbatim lines, got {} in:\n{}", verbatim, s);
+    assert!(
+        s.contains("and 195 more issue(s) with this code"),
+        "expected summary line, got:\n{}",
+        s
+    );
 }
 
 #[test]
