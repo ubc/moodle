@@ -1,0 +1,43 @@
+[package]
+name = "backup_scan_tool"
+version = "0.1.0"
+edition = "2021"
+description = "Scan Moodle MBZ backup archives for XML correctness and DB constraint violations"
+
+[lib]
+name = "backup_scan_tool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "backup_scan_tool"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bincode = "1"
+clap = { version = "4", features = ["derive"] }
+globset = "0.4"
+owo-colors = { version = "4", features = ["supports-colors"] }
+quick-xml = "0.36"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+walkdir = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
+
+[build-dependencies]
+anyhow = "1"
+bincode = "1"
+quick-xml = "0.36"
+serde = { version = "1", features = ["derive"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
