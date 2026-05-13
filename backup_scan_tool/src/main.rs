@@ -2,9 +2,12 @@
 
 mod cli;
 
-use std::io::{self, IsTerminal, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -48,28 +51,87 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     let schema = schema::schema();
 
+    let total = mbzs.len();
+    let show_progress = !cli.no_progress;
+    let started = Instant::now();
+    if show_progress {
+        eprintln!("Scanning {} MBZ file(s)...", total);
+    }
+    let completed = AtomicUsize::new(0);
+
     let results: Vec<MbzResult> = mbzs
         .par_iter()
-        .map(|p| scanner::scan_mbz(p, &schema, cli.strict))
+        .map(|p| {
+            let r = scanner::scan_mbz(p, &schema, cli.strict);
+            if show_progress {
+                let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let errors = r.errors() + r.fatal.is_some() as usize;
+                let warnings = r.warnings();
+                // One line per MBZ, locked write to keep parallel output
+                // from interleaving mid-line.
+                let stderr = io::stderr();
+                let mut h = stderr.lock();
+                let _ = writeln!(
+                    h,
+                    "[{}/{}] {} — {} error(s), {} warning(s)",
+                    n,
+                    total,
+                    p.display(),
+                    errors,
+                    warnings
+                );
+            }
+            r
+        })
         .collect();
 
     let report = Report { results };
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    match cli.format {
-        OutputFormat::Text => {
-            let color = out.is_terminal();
-            report.print_text(&mut out, color, cli.quiet, cli.max_issues_per_code)?;
-        }
-        OutputFormat::Json => {
-            report.print_json(&mut out)?;
-        }
-        OutputFormat::Sarif => {
-            report.print_sarif(&mut out)?;
-        }
+    if show_progress {
+        let elapsed = started.elapsed();
+        eprintln!(
+            "Done in {:.1}s — {} MBZ file(s) scanned, {} error(s), {} warning(s), {} fatal",
+            elapsed.as_secs_f64(),
+            total,
+            report.total_errors(),
+            report.total_warnings(),
+            report.fatal_count(),
+        );
     }
-    let _ = out.flush();
+
+    // Pick where the full report goes: --output file, else stdout. The
+    // sink type differs (BufWriter<File> vs StdoutLock), so we branch on
+    // it rather than carrying a Box<dyn Write> through the format match
+    // (which would lose IsTerminal for color detection on the stdout path).
+    if let Some(out_path) = &cli.output {
+        let f = File::create(out_path)
+            .with_context(|| format!("creating output file {}", out_path.display()))?;
+        let mut out = BufWriter::new(f);
+        match cli.format {
+            OutputFormat::Text => {
+                // No ANSI colour codes in a file.
+                report.print_text(&mut out, false, cli.quiet, cli.max_issues_per_code)?;
+            }
+            OutputFormat::Json => report.print_json(&mut out)?,
+            OutputFormat::Sarif => report.print_sarif(&mut out)?,
+        }
+        out.flush().ok();
+        if show_progress {
+            eprintln!("Report written to {}", out_path.display());
+        }
+    } else {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        match cli.format {
+            OutputFormat::Text => {
+                let color = out.is_terminal();
+                report.print_text(&mut out, color, cli.quiet, cli.max_issues_per_code)?;
+            }
+            OutputFormat::Json => report.print_json(&mut out)?,
+            OutputFormat::Sarif => report.print_sarif(&mut out)?,
+        }
+        let _ = out.flush();
+    }
 
     let errors = report.total_errors() + report.fatal_count();
     if errors > 0 {

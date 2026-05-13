@@ -54,6 +54,18 @@ pub struct Cli {
     #[arg(long, default_value_t = 5)]
     pub max_issues_per_code: usize,
 
+    /// Write the report to this file instead of stdout. Progress messages
+    /// still go to stderr so you can `--output report.txt` and watch
+    /// progress live. Works with --format text/json/sarif.
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
+
+    /// Suppress per-MBZ progress lines on stderr. By default a one-line
+    /// `[N/M] path — E error(s), W warning(s)` is emitted as each MBZ
+    /// finishes (useful for thousands of files).
+    #[arg(long)]
+    pub no_progress: bool,
+
     /// Verbose progress.
     #[arg(short, long)]
     pub verbose: bool,
