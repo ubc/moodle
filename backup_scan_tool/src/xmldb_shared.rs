@@ -56,6 +56,11 @@ pub struct Table {
     pub fields: HashMap<String, Field>,
     /// Source plugin path relative to the moodle root (informational only).
     pub plugin_path: String,
+    /// XML-element-name -> DB-column-name aliases declared by backup steplibs
+    /// via `set_source_alias(dbcol, xmlelem)`. Both keys and values are
+    /// stored lowercase. Populated at build time by parsing stepslib PHP.
+    #[serde(default)]
+    pub aliases: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -139,6 +144,7 @@ pub fn parse_install_xml(bytes: &[u8]) -> Result<Vec<Table>, String> {
                         name,
                         fields: HashMap::new(),
                         plugin_path: String::new(),
+                        aliases: HashMap::new(),
                     });
                 }
                 b"FIELDS" => {

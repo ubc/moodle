@@ -31,6 +31,7 @@ tar = "0.4"
 anyhow = "1"
 bincode = "1"
 quick-xml = "0.36"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 walkdir = "2"
 

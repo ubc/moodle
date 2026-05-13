@@ -31,6 +31,34 @@ use super::{Issue, Severity};
 use crate::schema::{Field, FieldType, Schema, Table};
 use crate::transformer;
 
+/// Element names that are deliberately emitted under a row even though they
+/// don't correspond to a column in that table's install.xml. Verified by
+/// reading the Moodle backup/restore code — these are either back-compat
+/// emissions, computed values, or cross-table denormalisations.
+///
+/// Keyed by (table_name, lower-cased element_name). Compared case-insensitive.
+const CROSS_TABLE_EMISSIONS: &[(&str, &str)] = &[
+    // backup_stepslib.php:547 — added explicitly for back-compat; the value
+    // lives in course_format_options, not course.
+    ("course", "numsections"),
+    // Same cross-table pattern, course_format_options.
+    ("course", "hiddensections"),
+    ("course", "coursedisplay"),
+    // backup_stepslib.php:482 references this field but it doesn't exist in
+    // lib/db/install.xml's course table (latent Moodle inconsistency).
+    ("course", "completionstartonenrol"),
+    // backup_stepslib.php:762 — JOIN'd from role_names.name AS nameincourse.
+    ("role", "nameincourse"),
+];
+
+fn is_known_cross_table(table: &str, leaf: &str) -> bool {
+    let table = table.to_ascii_lowercase();
+    let leaf = leaf.to_ascii_lowercase();
+    CROSS_TABLE_EMISSIONS
+        .iter()
+        .any(|(t, l)| *t == table && *l == leaf)
+}
+
 pub struct StructureOptions {
     /// Promote unknown-leaf warnings to errors.
     pub strict: bool,
@@ -158,7 +186,14 @@ impl<'s> Walker<'s> {
         // Direct child of a row: defer judgement.
         if parent_is_row {
             let ctx = self.ctx_stack.last().expect("checked above");
-            let field = ctx.table.fields.get(&lower);
+            // 1. Try direct match. 2. Fall back to a set_source_alias lookup
+            //    that points us at a real install.xml field.
+            let field = ctx.table.fields.get(&lower).or_else(|| {
+                ctx.table
+                    .aliases
+                    .get(&lower)
+                    .and_then(|dbcol| ctx.table.fields.get(dbcol))
+            });
             let location = self.current_location();
             self.deferred.push(DeferredChild {
                 name: name.to_string(),
@@ -235,6 +270,12 @@ impl<'s> Walker<'s> {
                     .unwrap_or("?");
                 // Skip warning if the leaf is empty (e.g. `<foo/>` or `<foo></foo>`).
                 if d.text_buf.trim().is_empty() {
+                    return;
+                }
+                // Skip warning for documented cross-table emissions (course
+                // format options serialised under <course>, role_names.name
+                // joined under <role>, etc).
+                if is_known_cross_table(parent_table, &d.name) {
                     return;
                 }
                 let msg = format!(
@@ -481,6 +522,7 @@ mod tests {
                 name: "widget".to_string(),
                 fields,
                 plugin_path: "mod/widget".to_string(),
+                aliases: HashMap::new(),
             },
         );
         Schema { tables }
@@ -585,6 +627,57 @@ mod tests {
         assert!(issues
             .iter()
             .any(|i| i.message.contains("fractional digits 3")));
+    }
+
+    #[test]
+    fn alias_resolves_to_field_and_validates() {
+        // Set up: widget table where `count_alias` aliases to `count`.
+        let mut s = sample_schema();
+        s.tables
+            .get_mut("widget")
+            .unwrap()
+            .aliases
+            .insert("count_alias".to_string(), "count".to_string());
+
+        let xml = r#"<widget id="1"><count_alias>abc</count_alias></widget>"#;
+        let issues = check("t.xml", xml.as_bytes(), &s, &StructureOptions::default());
+        // We expect a type error on the int field, NOT an "unknown leaf" warning.
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.severity == Severity::Error
+                    && i.message.contains("non-integer value")),
+            "expected int-validation error via alias, got: {:?}",
+            issues
+        );
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("unknown leaf")),
+            "should not emit unknown-leaf when alias resolves: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn cross_table_allowlist_silences_known_emissions() {
+        // <course> with <numsections> — must not warn even though numsections
+        // is not in the (real) course install.xml.
+        // We can't easily exercise this with sample_schema since the
+        // allowlist is keyed on "course"/"role"/etc. Use the real Schema:
+        let s = crate::schema::schema();
+        let Some(_) = s.table("course") else {
+            return; // skip if no course table in this build's schema
+        };
+        let xml = r#"<course id="1"><numsections>5</numsections></course>"#;
+        let issues = check("test.xml", xml.as_bytes(), &s, &StructureOptions::default());
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("numsections")),
+            "numsections should be silenced by allowlist: {:?}",
+            issues
+        );
     }
 
     #[test]
