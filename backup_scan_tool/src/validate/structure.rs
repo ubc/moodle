@@ -414,31 +414,46 @@ impl<'s> Walker<'s> {
         if value.is_empty() {
             return;
         }
-        if value.parse::<i64>().is_err() {
-            self.issues.push(Issue::error(
-                codes::STRUCT_INT_INVALID,
-                self.xml_file.clone(),
-                location.to_string(),
-                format!(
-                    "int field <{}> has non-integer value {:?}",
-                    field.name, value
-                ),
-            ));
-            return;
-        }
-        if let Some(max_digits) = field.length {
-            let digits = value.trim_start_matches('-').chars().count() as u32;
-            if digits > max_digits {
+        let parsed = match value.parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => {
                 self.issues.push(Issue::error(
-                    codes::STRUCT_INT_OVERFLOW,
+                    codes::STRUCT_INT_INVALID,
                     self.xml_file.clone(),
                     location.to_string(),
                     format!(
-                        "int field <{}> has {} digits but LENGTH=\"{}\"",
-                        field.name, digits, max_digits
+                        "int field <{}> has non-integer value {:?}",
+                        field.name, value
                     ),
                 ));
+                return;
             }
+        };
+        // Moodle XMLDB `LENGTH` on an int field selects the underlying SQL
+        // integer type (see lib/ddl/{mysql,postgres}_sql_generator.php). It is
+        // not a literal digit-count limit — e.g. LENGTH="10" maps to BIGINT,
+        // which holds any signed 64-bit value (up to 19 digits). Use the
+        // tightest cross-DB storage bound (MySQL's mapping) and check
+        // bit-wise fit on the parsed value.
+        let (storage, min, max) = int_storage_bounds(field.length);
+        if parsed < min || parsed > max {
+            self.issues.push(Issue::error(
+                codes::STRUCT_INT_OVERFLOW,
+                self.xml_file.clone(),
+                location.to_string(),
+                format!(
+                    "int field <{}> value {} exceeds {} range ({}..={}) for LENGTH=\"{}\"",
+                    field.name,
+                    parsed,
+                    storage,
+                    min,
+                    max,
+                    field
+                        .length
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "(unset)".to_string()),
+                ),
+            ));
         }
     }
 
@@ -527,6 +542,22 @@ impl<'s> Walker<'s> {
     }
 }
 
+/// Map an XMLDB `<FIELD TYPE="int" LENGTH="n">` to the (storage type name,
+/// min, max) the value must fit in. Mirrors Moodle's MySQL generator at
+/// `lib/ddl/mysql_sql_generator.php:404-419` — the tightest cross-DB bound,
+/// since Postgres's mapping is always >= MySQL's. None or 0 defaults to 10
+/// (BIGINT), matching `empty($xmldb_length)` behavior in the generator.
+fn int_storage_bounds(length: Option<u32>) -> (&'static str, i64, i64) {
+    let n = length.unwrap_or(10);
+    match n {
+        1..=2 => ("TINYINT", i8::MIN as i64, i8::MAX as i64),
+        3..=4 => ("SMALLINT", i16::MIN as i64, i16::MAX as i64),
+        5..=6 => ("MEDIUMINT", -8_388_608, 8_388_607),
+        7..=9 => ("INT", i32::MIN as i64, i32::MAX as i64),
+        _ => ("BIGINT", i64::MIN, i64::MAX),
+    }
+}
+
 fn id_attribute_value(e: &quick_xml::events::BytesStart) -> Option<String> {
     for attr in e.attributes().flatten() {
         if attr.key.as_ref().eq_ignore_ascii_case(b"id") {
@@ -592,6 +623,31 @@ mod tests {
                 default: None,
             },
         );
+        // Smaller-storage int fields for storage-range tests.
+        fields.insert(
+            "tiny".to_string(),
+            Field {
+                name: "tiny".to_string(),
+                ty: FieldType::Int,
+                length: Some(2),
+                decimals: None,
+                notnull: false,
+                sequence: false,
+                default: None,
+            },
+        );
+        fields.insert(
+            "small".to_string(),
+            Field {
+                name: "small".to_string(),
+                ty: FieldType::Int,
+                length: Some(9),
+                decimals: None,
+                notnull: false,
+                sequence: false,
+                default: None,
+            },
+        );
         fields.insert(
             "intro".to_string(),
             Field {
@@ -651,6 +707,57 @@ mod tests {
         let xml = r#"<widget id="1"><count>abc</count></widget>"#;
         let issues = run(xml);
         assert!(issues.iter().any(|i| i.message.contains("non-integer value")));
+    }
+
+    #[test]
+    fn int_length10_accepts_canvas_sized_id() {
+        // LENGTH="10" maps to BIGINT, which holds 17-digit Canvas IDs fine.
+        // This is the case that used to false-positive when we counted digits.
+        let xml = r#"<widget id="1"><count>10733742182625686</count></widget>"#;
+        let issues = run(xml);
+        assert!(
+            !issues.iter().any(|i| i.code == codes::STRUCT_INT_OVERFLOW),
+            "BIGINT-fitting value should not overflow: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn int_length2_overflows_tinyint() {
+        // LENGTH="2" → TINYINT, max signed 127.
+        let xml = r#"<widget id="1"><tiny>200</tiny></widget>"#;
+        let issues = run(xml);
+        assert!(
+            issues.iter().any(|i| i.code == codes::STRUCT_INT_OVERFLOW
+                && i.message.contains("TINYINT")),
+            "expected TINYINT overflow: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn int_length9_overflows_int() {
+        // LENGTH="9" → INT, max signed 2_147_483_647.
+        let xml = r#"<widget id="1"><small>9999999999</small></widget>"#;
+        let issues = run(xml);
+        assert!(
+            issues.iter().any(|i| i.code == codes::STRUCT_INT_OVERFLOW
+                && i.message.contains("INT")),
+            "expected INT overflow: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn int_negative_within_storage_range_ok() {
+        // -100 fits in TINYINT (-128..=127); leading '-' shouldn't trip us.
+        let xml = r#"<widget id="1"><tiny>-100</tiny></widget>"#;
+        let issues = run(xml);
+        assert!(
+            !issues.iter().any(|i| i.code == codes::STRUCT_INT_OVERFLOW),
+            "negative within range should not overflow: {:?}",
+            issues
+        );
     }
 
     #[test]
