@@ -124,8 +124,10 @@ class restore_qtype_extrafields_plugin extends restore_qtype_plugin {
             // Insert record.
             $newitemid = $DB->insert_record($tablename, $data);
 
-            // Create mapping.
-            $this->set_mapping($tablename, $oldid, $newitemid);
+            // Create mapping. $isnew=true: qtype_*_options itemnames are
+            // execute-plan-only (not populated during precheck), and the
+            // $questioncreated guard ensures one write per oldid per restore.
+            $this->set_mapping($tablename, $oldid, $newitemid, false, null, null, true);
         }
     }
 }

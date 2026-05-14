@@ -5123,7 +5123,9 @@ class restore_create_categories_and_questions extends restore_structure_step {
         if (empty($data->parent)) {
             if (!$top = question_get_top_category($data->contextid)) {
                 $top = question_get_top_category($data->contextid, true);
-                $this->set_mapping('question_category_created', $oldid, $top->id, false, null, $data->contextid);
+                // $isnew=true: 'question_category_created' is only ever written here and at line 5150
+                // below, never during precheck. Each oldid hits at most one branch.
+                $this->set_mapping('question_category_created', $oldid, $top->id, false, null, $data->contextid, true);
             }
             $this->set_mapping('question_category', $oldid, $top->id);
         } else {
@@ -5147,7 +5149,8 @@ class restore_create_categories_and_questions extends restore_structure_step {
             $this->set_mapping('question_category', $oldid, $newitemid);
             // Also annotate them as question_category_created, we need
             // that later when remapping parents.
-            $this->set_mapping('question_category_created', $oldid, $newitemid, false, null, $data->contextid);
+            // $isnew=true: 'question_category_created' is execute-plan-only.
+            $this->set_mapping('question_category_created', $oldid, $newitemid, false, null, $data->contextid, true);
         }
     }
 
@@ -5282,7 +5285,8 @@ class restore_create_categories_and_questions extends restore_structure_step {
                 }
 
                 $this->latestqbe->newid = $DB->insert_record('question_bank_entries', $this->latestqbe);
-                $this->set_mapping('question_bank_entry', $this->latestqbe->oldid, $this->latestqbe->newid);
+                // $isnew=true: 'question_bank_entry' is execute-plan-only (not written during precheck).
+                $this->set_mapping('question_bank_entry', $this->latestqbe->oldid, $this->latestqbe->newid, false, null, null, true);
             }
 
             if (
@@ -5299,15 +5303,17 @@ class restore_create_categories_and_questions extends restore_structure_step {
             $this->set_mapping('question', $oldid, $newitemid);
             // Also annotate them as question_created, we need
             // that later when remapping parents (keeping the old categoryid as parentid).
+            // $isnew=true: 'question_created' is execute-plan-only (not written during precheck).
             $parentcatid = $this->get_old_parentid('question_category');
-            $this->set_mapping('question_created', $oldid, $newitemid, false, null, $parentcatid);
+            $this->set_mapping('question_created', $oldid, $newitemid, false, null, $parentcatid, true);
 
             // Also insert this question_version.
             $oldqvid = $this->latestversion->id;
             $this->latestversion->questionbankentryid = $this->latestqbe->newid;
             $this->latestversion->questionid = $newitemid;
             $newqvid = $DB->insert_record('question_versions', $this->latestversion);
-            $this->set_mapping('question_versions', $oldqvid, $newqvid);
+            // $isnew=true: 'question_versions' is execute-plan-only.
+            $this->set_mapping('question_versions', $oldqvid, $newqvid, false, null, null, true);
 
         } else {
             // By performing this set_mapping() we make get_old/new_parentid() to work for all the
@@ -5632,6 +5638,15 @@ class restore_create_question_files extends restore_execution_step {
                                                         AND bi.itemname = 'question_created'
                                                ORDER BY categoryid ASC", array($this->get_restoreid()));
 
+        // Track sent file-pool sends to avoid re-processing the same backup_files_temp
+        // rows once per category. send_common_files / send_qtype_files filter only by
+        // (component, filearea, contextid) — not by category. Categories that share the
+        // same source/target contextid (the normal case for course-level question banks)
+        // would otherwise re-process identical rows once per category. With N categories
+        // sharing one context, the file-pool query returns the same set of rows N times.
+        $sentcommon = [];
+        $sentqtype  = [];
+
         $currentcatid = -1;
         foreach ($catqtypes as $categoryid => $row) {
             $qtype = $row->qtype;
@@ -5652,11 +5667,19 @@ class restore_create_question_files extends restore_execution_step {
                 $oldctxid = $qcatmapping->info->contextid;
                 $newctxid = $qcatmapping->parentitemid;
 
-                $this->send_common_files($oldctxid, $newctxid, $progress);
+                $commonkey = "$oldctxid->$newctxid";
+                if (!isset($sentcommon[$commonkey])) {
+                    $this->send_common_files($oldctxid, $newctxid, $progress);
+                    $sentcommon[$commonkey] = true;
+                }
                 $currentcatid = $categoryid;
             }
 
-            $this->send_qtype_files($qtype, $oldctxid, $newctxid, $progress);
+            $qtypekey = "$qtype:$oldctxid->$newctxid";
+            if (!isset($sentqtype[$qtypekey])) {
+                $this->send_qtype_files($qtype, $oldctxid, $newctxid, $progress);
+                $sentqtype[$qtypekey] = true;
+            }
         }
         $catqtypes->close();
         $progress->end_progress();

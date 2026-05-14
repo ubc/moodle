@@ -77,7 +77,9 @@ class restore_qtype_multianswer_plugin extends restore_qtype_plugin {
             // Insert record.
             $newitemid = $DB->insert_record('question_multianswer', $data);
             // Create mapping (need it for after_execute recode of sequence).
-            $this->set_mapping('question_multianswer', $oldid, $newitemid);
+            // $isnew=true: 'question_multianswer' is execute-plan-only; the $questioncreated
+            // guard above means one write per question per restore.
+            $this->set_mapping('question_multianswer', $oldid, $newitemid, false, null, null, true);
         }
     }
 

@@ -76,7 +76,9 @@ class restore_qtype_multichoice_plugin extends restore_qtype_plugin {
             // We need to check to avoid that.
             if (!$DB->record_exists('qtype_multichoice_options', array('questionid' => $data->questionid))) {
                 $newitemid = $DB->insert_record('qtype_multichoice_options', $data);
-                $this->set_mapping('qtype_multichoice_options', $oldid, $newitemid);
+                // $isnew=true: itemname is execute-plan-only; record_exists guard above
+                // ensures one write per question per restore.
+                $this->set_mapping('qtype_multichoice_options', $oldid, $newitemid, false, null, null, true);
             }
         }
     }

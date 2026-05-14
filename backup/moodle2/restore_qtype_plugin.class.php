@@ -229,7 +229,9 @@ abstract class restore_qtype_plugin extends restore_plugin {
             $newitemid = $this->questionanswercache[$data->answertext];
         }
         // Create mapping (we'll use this intensively when restoring question_states. And also answerfeedback files)
-        $this->set_mapping('question_answer', $oldid, $newitemid);
+        // $isnew=true: 'question_answer' is execute-plan-only (not populated during precheck).
+        // In the existing-question else branch above this is also a first write for this oldid.
+        $this->set_mapping('question_answer', $oldid, $newitemid, false, null, null, true);
     }
 
     /**

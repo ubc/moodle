@@ -62,7 +62,9 @@ class restore_users_parser_processor extends grouped_parser_processor {
         $info = $data['tags'];
         // Only load it if needed (exist same userref itemid in table)
         if (restore_dbops::get_backup_ids_record($this->restoreid, 'userref', $itemid)) {
-            restore_dbops::set_backup_ids_record($this->restoreid, $itemname, $itemid, 0, $parentitemid, $info);
+            // $isnew=true: users.xml has each user id at most once, and this
+            // loader runs at most once per restore (precheck OR plan step).
+            restore_dbops::set_backup_ids_record($this->restoreid, $itemname, $itemid, 0, $parentitemid, $info, true);
         }
     }
 

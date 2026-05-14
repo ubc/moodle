@@ -255,10 +255,15 @@ abstract class restore_dbops {
      * @param string $itemname name of the item
      * @param int $itemid id of item
      * @param array $extrarecord extra record which needs to be updated
+     * @param bool $isnew when the caller knows this (backupid, itemname, itemid) tuple
+     *     does not yet exist in backup_ids_temp (e.g. precheck parser processors
+     *     populating a freshly-created temp table), skip the precondition
+     *     get_record check and INSERT directly. backup_ids_temp has a UNIQUE
+     *     key on (backupid, itemname, itemid) so collisions would error loudly.
      * @return void
      * @todo MDL-25290 replace static BACKUP_IDS_* with MUC code
      */
-    protected static function set_backup_ids_cached($restoreid, $itemname, $itemid, $extrarecord) {
+    protected static function set_backup_ids_cached($restoreid, $itemname, $itemid, $extrarecord, $isnew = false) {
         global $DB;
 
         $key = "$itemid $itemname $restoreid";
@@ -271,6 +276,24 @@ abstract class restore_dbops {
 
         // If record is not cached then add one.
         if (!isset(self::$backupidsexist[$key])) {
+            // Fast path: caller asserts this is a new row. Skip the get_record probe
+            // (which on cache miss is a wasted DB roundtrip ~88% of the time per
+            // pg_stat_statements analysis of large-question-bank restores).
+            if ($isnew) {
+                $recorddefault = array (
+                    'newitemid' => 0,
+                    'parentitemid' => null,
+                    'info' => null);
+                $record = array_merge($record, $recorddefault, $extrarecord);
+                $record['id'] = $DB->insert_record('backup_ids_temp', $record);
+                self::$backupidsexist[$key] = $record['id'];
+                self::$backupidsexistsize--;
+                if (self::$backupidscachesize > 0) {
+                    self::$backupidscache[$key] = (object) $record;
+                    self::$backupidscachesize--;
+                }
+                return;
+            }
             // If we have this record in db, then just update this.
             if ($existingrecord = $DB->get_record('backup_ids_temp', $record)) {
                 self::$backupidsexist[$key] = $existingrecord->id;
@@ -1796,7 +1819,7 @@ abstract class restore_dbops {
         $DB->insert_record('backup_files_temp', $filerec);
     }
 
-    public static function set_backup_ids_record($restoreid, $itemname, $itemid, $newitemid = 0, $parentitemid = null, $info = null) {
+    public static function set_backup_ids_record($restoreid, $itemname, $itemid, $newitemid = 0, $parentitemid = null, $info = null, $isnew = false) {
         // Build conditionally the extra record info
         $extrarecord = array();
         if ($newitemid != 0) {
@@ -1809,7 +1832,7 @@ abstract class restore_dbops {
             $extrarecord['info'] = backup_controller_dbops::encode_backup_temp_info($info);
         }
 
-        self::set_backup_ids_cached($restoreid, $itemname, $itemid, $extrarecord);
+        self::set_backup_ids_cached($restoreid, $itemname, $itemid, $extrarecord, $isnew);
     }
 
     public static function get_backup_ids_record($restoreid, $itemname, $itemid) {
