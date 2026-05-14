@@ -51,7 +51,9 @@ class restore_roles_parser_processor extends grouped_parser_processor {
         $info = $data['tags'];
         // Only load it if needed (exist same roleref itemid in table)
         if (restore_dbops::get_backup_ids_record($this->restoreid, 'roleref', $itemid)) {
-            restore_dbops::set_backup_ids_record($this->restoreid, $itemname, $itemid, 0, null, $info);
+            // $isnew=true: roles.xml has each role id at most once, and this
+            // loader runs at most once per restore (precheck OR plan step).
+            restore_dbops::set_backup_ids_record($this->restoreid, $itemname, $itemid, 0, null, $info, true);
         }
     }
 

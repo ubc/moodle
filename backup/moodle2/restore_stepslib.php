@@ -5604,6 +5604,15 @@ class restore_create_question_files extends restore_execution_step {
                                                         AND bi.itemname = 'question_created'
                                                ORDER BY categoryid ASC", array($this->get_restoreid()));
 
+        // Track sent file-pool sends to avoid re-processing the same backup_files_temp
+        // rows once per category. send_common_files / send_qtype_files filter only by
+        // (component, filearea, contextid) — not by category. Categories that share the
+        // same source/target contextid (the normal case for course-level question banks)
+        // would otherwise re-process identical rows once per category. With N categories
+        // sharing one context, the file-pool query returns the same set of rows N times.
+        $sentcommon = [];
+        $sentqtype  = [];
+
         $currentcatid = -1;
         foreach ($catqtypes as $categoryid => $row) {
             $qtype = $row->qtype;
@@ -5624,11 +5633,19 @@ class restore_create_question_files extends restore_execution_step {
                 $oldctxid = $qcatmapping->info->contextid;
                 $newctxid = $qcatmapping->parentitemid;
 
-                $this->send_common_files($oldctxid, $newctxid, $progress);
+                $commonkey = "$oldctxid->$newctxid";
+                if (!isset($sentcommon[$commonkey])) {
+                    $this->send_common_files($oldctxid, $newctxid, $progress);
+                    $sentcommon[$commonkey] = true;
+                }
                 $currentcatid = $categoryid;
             }
 
-            $this->send_qtype_files($qtype, $oldctxid, $newctxid, $progress);
+            $qtypekey = "$qtype:$oldctxid->$newctxid";
+            if (!isset($sentqtype[$qtypekey])) {
+                $this->send_qtype_files($qtype, $oldctxid, $newctxid, $progress);
+                $sentqtype[$qtypekey] = true;
+            }
         }
         $catqtypes->close();
         $progress->end_progress();

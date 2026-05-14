@@ -128,7 +128,11 @@ class restore_questions_parser_processor extends grouped_parser_processor {
 
         // Only load it if needed (exist same question_categoryref itemid in table)
         if (restore_dbops::get_backup_ids_record($this->restoreid, 'question_categoryref', $this->lastcatid)) {
-            restore_dbops::set_backup_ids_record($this->restoreid, $itemname, $itemid, 0, $parentitemid, $info);
+            // $isnew=true: each question_category and question id appears at most
+            // once in questions.xml, and this loader runs at most once per restore
+            // (precheck OR plan step). Skipping the precondition get_record probe
+            // removes ~70k+ wasted DB roundtrips on large question banks.
+            restore_dbops::set_backup_ids_record($this->restoreid, $itemname, $itemid, 0, $parentitemid, $info, true);
         }
     }
 
