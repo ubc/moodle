@@ -5448,18 +5448,46 @@ class restore_create_categories_and_questions extends restore_structure_step {
             }
         }
 
-        // Now, recode all the created question->parent fields
-        $qs = $DB->get_records('backup_ids_temp', array(
-                  'backupid' => $this->get_restoreid(),
-                  'itemname' => 'question_created'));
-        foreach ($qs as $q) {
-            $dbq = $DB->get_record('question', array('id' => $q->newitemid));
-            // Get new parent (mapped or created, so we look in question mappings)
-            if ($newparent = $DB->get_field('backup_ids_temp', 'newitemid', array(
-                                 'backupid' => $this->get_restoreid(),
-                                 'itemname' => 'question',
-                                 'itemid'   => $dbq->parent))) {
-                $DB->set_field('question', 'parent', $newparent, array('id' => $dbq->id));
+        // Now, recode all the created question->parent fields. On Postgres we can
+        // do this in a single UPDATE that joins the two backup_ids_temp rows
+        // (the 'question_created' mapping for the row being updated, and the
+        // 'question' mapping for that row's old parent id). For 67k questions the
+        // PHP loop is 2 SELECTs + 1 UPDATE per row -- ~200k roundtrips through the
+        // PHP <-> DB socket -- which on docker-on-mac is ~30s of pure latency.
+        // The set-based UPDATE measured at ~1-2s for the same work.
+        //
+        // Other DB families fall back to the row-by-row loop. The structurally
+        // important part of the plan is the order in the comma-FROM list and that
+        // the join predicates can ride the UNIQUE index on
+        // (backupid, itemname, itemid). EXPLAIN confirms PG produces a clean
+        // nested-loop of index probes driven from bi_c.
+        $restoreid = $this->get_restoreid();
+        if ($DB->get_dbfamily() === 'postgres') {
+            $sql = "UPDATE {question}
+                       SET parent = bi_p.newitemid
+                      FROM {backup_ids_temp} bi_c, {backup_ids_temp} bi_p
+                     WHERE bi_c.backupid = :p1
+                       AND bi_c.itemname = 'question_created'
+                       AND bi_c.newitemid = {question}.id
+                       AND bi_p.backupid = :p2
+                       AND bi_p.itemname = 'question'
+                       AND bi_p.itemid = {question}.parent
+                       AND bi_p.newitemid > 0
+                       AND {question}.parent > 0";
+            $DB->execute($sql, ['p1' => $restoreid, 'p2' => $restoreid]);
+        } else {
+            $qs = $DB->get_records('backup_ids_temp', array(
+                      'backupid' => $restoreid,
+                      'itemname' => 'question_created'));
+            foreach ($qs as $q) {
+                $dbq = $DB->get_record('question', array('id' => $q->newitemid));
+                // Get new parent (mapped or created, so we look in question mappings)
+                if ($newparent = $DB->get_field('backup_ids_temp', 'newitemid', array(
+                                     'backupid' => $restoreid,
+                                     'itemname' => 'question',
+                                     'itemid'   => $dbq->parent))) {
+                    $DB->set_field('question', 'parent', $newparent, array('id' => $dbq->id));
+                }
             }
         }
 
