@@ -34,9 +34,31 @@ defined('MOODLE_INTERNAL') || die();
 abstract class backup_general_helper extends backup_helper {
 
     /**
-     * Calculate one checksum for any array/object. Works recursively
+     * Calculate one checksum for any array/object. Works recursively.
+     *
+     * Public entry point preserves the original single-argument signature for
+     * backwards compatibility. The actual work runs in a private helper that
+     * threads a SplObjectStorage of already-visited objects through the
+     * recursion to defend against cycles. Without this guard, any
+     * non-checksumable object reachable from the controller graph that holds
+     * a back-reference (directly or via another non-checksumable object)
+     * drives unbounded recursion and OOM. Closest related upstream issue:
+     * MDL-74711 (closed as duplicate of MDL-74548, which only patched the
+     * MODE_COPY trigger; the underlying recursion vulnerability remained).
      */
     public static function array_checksum_recursive($arr) {
+        return self::array_checksum_recursive_inner($arr, new SplObjectStorage());
+    }
+
+    /**
+     * Internal worker for {@see array_checksum_recursive}.
+     *
+     * @param array $arr Array to checksum. Caller must cast objects beforehand.
+     * @param SplObjectStorage $seen Objects already walked in the current
+     *   computation; revisits emit a constant cycle marker instead of
+     *   recursing into the cast-to-array branch.
+     */
+    private static function array_checksum_recursive_inner($arr, SplObjectStorage $seen) {
 
         $checksum = ''; // Init checksum
 
@@ -48,9 +70,21 @@ abstract class backup_general_helper extends backup_helper {
             if ($value instanceof checksumable) {
                 $checksum = md5($checksum . '-' . $key . '-' . $value->calculate_checksum());
             } else if (is_object($value)) {
-                $checksum = md5($checksum . '-' . $key . '-' . self::array_checksum_recursive((array)$value));
+                // Cycle guard: if we've already walked this object in the
+                // current checksum computation, emit a stable cycle marker
+                // and stop. The data inside the object has already been
+                // mixed into the checksum at its first visit.
+                // ArrayAccess form (isset / assignment) used instead of
+                // SplObjectStorage::contains()/attach(), which are deprecated
+                // from PHP 8.5.
+                if (isset($seen[$value])) {
+                    $checksum = md5($checksum . '-' . $key . '-cycle-' . get_class($value));
+                    continue;
+                }
+                $seen[$value] = true;
+                $checksum = md5($checksum . '-' . $key . '-' . self::array_checksum_recursive_inner((array)$value, $seen));
             } else if (is_array($value)) {
-                $checksum = md5($checksum . '-' . $key . '-' . self::array_checksum_recursive($value));
+                $checksum = md5($checksum . '-' . $key . '-' . self::array_checksum_recursive_inner($value, $seen));
             } else {
                 $checksum = md5($checksum . '-' . $key . '-' . $value);
             }
