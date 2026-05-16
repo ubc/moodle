@@ -63,6 +63,24 @@ class exifremover_service extends service implements file_redactor_service_inter
     /** @var bool $useexiftool Flag indicating whether to use ExifTool. */
     private bool $useexiftool = false;
 
+    /** @var int Seconds to wait for the shared ExifTool process to finish redacting one file. */
+    private const EXIFTOOL_READY_TIMEOUT = 60;
+
+    /** @var resource|null Shared long-lived ExifTool process (-stay_open mode), reused across all files. */
+    private static $exiftoolprocess = null;
+
+    /** @var array|null Pipes [0 => stdin, 1 => stdout] of the shared ExifTool process. */
+    private static ?array $exiftoolpipes = null;
+
+    /** @var bool Whether the shutdown handler for the shared ExifTool process has been registered. */
+    private static bool $exiftoolshutdownregistered = false;
+
+    /** @var bool Set once the shared ExifTool process has failed to start, to stop retrying. */
+    private static bool $exiftoolpersistentfailed = false;
+
+    /** @var int Consecutive persistent-process failures; after a few we stop using it. */
+    private static int $exiftoolconsecutivefailures = 0;
+
     /** @var int Normal orientation (no rotation). */
     private const TOP_LEFT = 1;
 
@@ -143,7 +161,15 @@ class exifremover_service extends service implements file_redactor_service_inter
     private function execute_exiftool(string $sourcefile): string {
         $destinationfile = make_request_directory() . '/' . basename($sourcefile);
 
-        // Prepare the ExifTool command.
+        // Prefer a single long-lived ExifTool process (-stay_open mode) shared across
+        // every file processed in this request. This avoids spawning — and paying the
+        // Perl interpreter + module load cost of — a fresh ExifTool process per file,
+        // which is a significant cost on image-heavy operations such as course restore.
+        if ($this->redact_with_persistent_exiftool($sourcefile, $destinationfile)) {
+            return $destinationfile;
+        }
+
+        // Fall back to a one-shot invocation if the persistent process is unavailable.
         $command = $this->get_exiftool_command($sourcefile, $destinationfile);
 
         // Run the command.
@@ -160,6 +186,209 @@ class exifremover_service extends service implements file_redactor_service_inter
         }
 
         return $destinationfile;
+    }
+
+    /**
+     * Redacts one file through the shared long-lived ExifTool process (-stay_open mode).
+     *
+     * On any failure the persistent process is torn down and false is returned, so the
+     * caller transparently falls back to a one-shot ExifTool invocation.
+     *
+     * @param string $sourcefile The file to redact.
+     * @param string $destinationfile The path ExifTool should write the redacted copy to.
+     * @return bool True if the redacted file was produced; false to trigger the fallback.
+     */
+    private function redact_with_persistent_exiftool(string $sourcefile, string $destinationfile): bool {
+        // The -stay_open argument-file protocol is newline-delimited and is not shell
+        // parsed; a path containing a newline would corrupt it, so fall back instead.
+        if (preg_match('/[\r\n]/', $sourcefile . $destinationfile)) {
+            return false;
+        }
+
+        try {
+            $pipes = $this->get_persistent_exiftool_pipes();
+            if ($pipes === null) {
+                return false;
+            }
+
+            // One argument per line, terminated by -execute (the -stay_open protocol).
+            // No "--" separator before the source: under -stay_open it would make
+            // ExifTool treat the trailing "-execute" as a filename rather than the run
+            // command. Moodle file-pool paths are absolute, so "--" is not needed.
+            $arguments = array_merge(
+                $this->get_exiftool_arguments(),
+                ['-o', $destinationfile, $sourcefile, '-execute'],
+            );
+            if (fwrite($pipes[0], implode("\n", $arguments) . "\n") === false) {
+                // The process is no longer usable.
+                self::note_persistent_exiftool_failure();
+                return false;
+            }
+            fflush($pipes[0]);
+
+            // ExifTool prints "{ready}" on stdout once the -execute has finished.
+            if (!self::wait_for_exiftool_ready($pipes[1])) {
+                // The process is unresponsive — tear it down and count the failure.
+                self::note_persistent_exiftool_failure();
+                return false;
+            }
+
+            if (file_exists($destinationfile)) {
+                self::$exiftoolconsecutivefailures = 0;
+                return true;
+            }
+
+            // ExifTool finished but produced no file: a per-file problem, not a broken
+            // process — fall back for this file only, keeping the process alive.
+            return false;
+        } catch (\Throwable $e) {
+            self::note_persistent_exiftool_failure();
+            return false;
+        }
+    }
+
+    /**
+     * Records a failure of the shared ExifTool process: tears it down, and after a few
+     * consecutive failures stops using the persistent path for the rest of the request
+     * so a misbehaving process cannot stall every file.
+     */
+    private static function note_persistent_exiftool_failure(): void {
+        self::close_persistent_exiftool();
+        if (++self::$exiftoolconsecutivefailures >= 3) {
+            self::$exiftoolpersistentfailed = true;
+        }
+    }
+
+    /**
+     * Returns the ExifTool arguments that strip metadata, one element per argument.
+     *
+     * Unlike {@see get_exiftool_command()} these are not shell quoted: the -stay_open
+     * protocol passes each line as a literal argument with no shell involved.
+     *
+     * @return string[]
+     */
+    private function get_exiftool_arguments(): array {
+        // get_remove_tags() returns a shell-quoted token (e.g. -gps*= wrapped in double
+        // quotes so the shell does not glob it); strip those quotes for literal use.
+        $arguments = [trim($this->get_remove_tags(), '"'), '-tagsfromfile', '@'];
+        foreach (preg_split('/\s+/', trim(self::PRESERVE_TAGS)) as $preservetag) {
+            if ($preservetag !== '') {
+                $arguments[] = $preservetag;
+            }
+        }
+        return $arguments;
+    }
+
+    /**
+     * Returns the stdin/stdout pipes of the shared ExifTool process, starting it on
+     * first use and restarting it if it has exited.
+     *
+     * @return array|null [0 => stdin, 1 => stdout], or null if it could not be started.
+     */
+    private function get_persistent_exiftool_pipes(): ?array {
+        if (self::$exiftoolpersistentfailed) {
+            return null;
+        }
+
+        if (is_resource(self::$exiftoolprocess)) {
+            $status = proc_get_status(self::$exiftoolprocess);
+            if (!empty($status['running'])) {
+                return self::$exiftoolpipes;
+            }
+            // The process has exited — clean up before starting a fresh one.
+            self::close_persistent_exiftool();
+        }
+
+        $exiftool = $this->get_exiftool_path();
+        if (empty($exiftool)) {
+            return null;
+        }
+
+        // -stay_open keeps ExifTool resident; "-@ -" reads commands from stdin. stderr
+        // is discarded, mirroring the "2> /dev/null" of the one-shot command.
+        $descriptors = [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['file', '/dev/null', 'a'],
+        ];
+        $pipes = [];
+        $process = proc_open(
+            escapeshellarg($exiftool) . ' -stay_open True -@ -',
+            $descriptors,
+            $pipes,
+        );
+        if (!is_resource($process)) {
+            // Do not retry a spawn that cannot succeed; fall back for the rest of the request.
+            self::$exiftoolpersistentfailed = true;
+            return null;
+        }
+
+        self::$exiftoolprocess = $process;
+        self::$exiftoolpipes = $pipes;
+
+        // Ensure the resident process is shut down cleanly at the end of the request.
+        if (!self::$exiftoolshutdownregistered) {
+            \core_shutdown_manager::register_function([self::class, 'close_persistent_exiftool']);
+            self::$exiftoolshutdownregistered = true;
+        }
+
+        return self::$exiftoolpipes;
+    }
+
+    /**
+     * Blocks until the shared ExifTool process emits its "{ready}" marker for the most
+     * recent -execute, or the timeout elapses.
+     *
+     * @param resource $stdout stdout pipe of the shared process.
+     * @return bool True if "{ready}" was seen; false on timeout or EOF.
+     */
+    private static function wait_for_exiftool_ready($stdout): bool {
+        $deadline = microtime(true) + self::EXIFTOOL_READY_TIMEOUT;
+        $buffer = '';
+        while (microtime(true) < $deadline) {
+            $read = [$stdout];
+            $write = $except = null;
+            $ready = stream_select($read, $write, $except, 1);
+            if ($ready === false) {
+                return false;
+            }
+            if ($ready === 0) {
+                continue; // Nothing yet — keep waiting until the deadline.
+            }
+            $chunk = fread($stdout, 8192);
+            if ($chunk === false || $chunk === '') {
+                return false; // EOF — the process has gone away.
+            }
+            $buffer .= $chunk;
+            if (strpos($buffer, '{ready}') !== false) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Shuts down the shared ExifTool process if it is running.
+     *
+     * Public and static so it can be registered as a request shutdown handler; also
+     * called whenever the process is found to have died unexpectedly.
+     */
+    public static function close_persistent_exiftool(): void {
+        if (is_array(self::$exiftoolpipes)) {
+            // Asking ExifTool to leave -stay_open mode lets it exit cleanly.
+            if (is_resource(self::$exiftoolpipes[0] ?? null)) {
+                @fwrite(self::$exiftoolpipes[0], "-stay_open\nFalse\n");
+                @fclose(self::$exiftoolpipes[0]);
+            }
+            if (is_resource(self::$exiftoolpipes[1] ?? null)) {
+                @fclose(self::$exiftoolpipes[1]);
+            }
+        }
+        if (is_resource(self::$exiftoolprocess)) {
+            @proc_close(self::$exiftoolprocess);
+        }
+        self::$exiftoolprocess = null;
+        self::$exiftoolpipes = null;
     }
 
     /**
