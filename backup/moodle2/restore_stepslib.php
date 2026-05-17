@@ -5266,42 +5266,27 @@ class restore_create_categories_and_questions extends restore_structure_step {
         if (!$questionmapping->newitemid) {
             // Now we know we are inserting a question, we may need to insert the questionbankentry.
             if (empty($this->latestqbe->newid)) {
-                // Guard against duplicate <question_bank_entry id="X"> elements in the source
-                // backup XML. Some sources (typically course-level backups where one qbe is
-                // reachable from two question_categories) emit the same qbe id twice; the
-                // restore parser then visits process_question_bank_entry twice, resetting
-                // $this->latestqbe to a fresh object each time (no ->newid) and leading us here
-                // for the second occurrence. Insert is still safe (we'd produce a second
-                // question_bank_entries row in the destination), but set_mapping below uses
-                // $isnew=true and would hit the (backupid, itemname, itemid) unique key. Reuse
-                // the prior mapping instead — both source questions will share one destination
-                // qbe row, which is the cleaner outcome for what is fundamentally source-side
-                // data duplication.
-                if ($existingnewid = $this->get_mappingid('question_bank_entry', $this->latestqbe->id)) {
-                    $this->latestqbe->newid = $existingnewid;
+                $this->latestqbe->oldid = $this->latestqbe->id;
+
+                $this->latestqbe->questioncategoryid = $this->get_new_parentid('question_category');
+                $userid = $this->get_mappingid('user', $this->latestqbe->ownerid);
+                if ($userid) {
+                    $this->latestqbe->ownerid = $userid;
                 } else {
-                    $this->latestqbe->oldid = $this->latestqbe->id;
-
-                    $this->latestqbe->questioncategoryid = $this->get_new_parentid('question_category');
-                    $userid = $this->get_mappingid('user', $this->latestqbe->ownerid);
-                    if ($userid) {
-                        $this->latestqbe->ownerid = $userid;
-                    } else {
-                        if (!$this->task->is_samesite()) {
-                            $this->latestqbe->ownerid = $this->task->get_userid();
-                        }
+                    if (!$this->task->is_samesite()) {
+                        $this->latestqbe->ownerid = $this->task->get_userid();
                     }
-
-                    // The idnumber if it exists also needs to be unique within a category or reset it to null.
-                    if (!empty($this->latestqbe->idnumber) && $DB->record_exists('question_bank_entries',
-                            ['idnumber' => $this->latestqbe->idnumber, 'questioncategoryid' => $this->latestqbe->questioncategoryid])) {
-                        unset($this->latestqbe->idnumber);
-                    }
-
-                    $this->latestqbe->newid = $DB->insert_record('question_bank_entries', $this->latestqbe);
-                    // $isnew=true: 'question_bank_entry' is execute-plan-only (not written during precheck).
-                    $this->set_mapping('question_bank_entry', $this->latestqbe->oldid, $this->latestqbe->newid, false, null, null, true);
                 }
+
+                // The idnumber if it exists also needs to be unique within a category or reset it to null.
+                if (!empty($this->latestqbe->idnumber) && $DB->record_exists('question_bank_entries',
+                        ['idnumber' => $this->latestqbe->idnumber, 'questioncategoryid' => $this->latestqbe->questioncategoryid])) {
+                    unset($this->latestqbe->idnumber);
+                }
+
+                $this->latestqbe->newid = $DB->insert_record('question_bank_entries', $this->latestqbe);
+                // $isnew=true: 'question_bank_entry' is execute-plan-only (not written during precheck).
+                $this->set_mapping('question_bank_entry', $this->latestqbe->oldid, $this->latestqbe->newid, false, null, null, true);
             }
 
             if (
