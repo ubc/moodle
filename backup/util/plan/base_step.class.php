@@ -27,7 +27,7 @@
  *
  * TODO: Finish phpdocs
  */
-abstract class base_step implements checksumable, executable, loggable {
+abstract class base_step implements executable, loggable {
 
     /** @var string One simple name for identification purposes */
     protected $name;
@@ -65,28 +65,6 @@ abstract class base_step implements checksumable, executable, loggable {
     public function destroy() {
         // No need to destroy anything recursively here, direct reset
         $this->task = null;
-    }
-
-    // checksumable interface methods
-
-    /**
-     * Cheap, non-recursive checksum. Identity by class + name is sufficient
-     * because the plan-tree shape is fixed at controller construction; runtime
-     * mutations to step-internal mapping arrays don't need to be reflected here
-     * (save/load both go through this method, so integrity is preserved).
-     *
-     * Critically, this avoids exposing `$this->task` (a back-reference to a
-     * checksumable) and `$this->contentprocessor` (a non-checksumable parser
-     * that holds `$this` back), which together drove unbounded recursion in
-     * `array_checksum_recursive` when steps were walked via the `is_object`
-     * cast-to-array branch.
-     */
-    public function calculate_checksum() {
-        return md5(get_class($this) . '-' . $this->name);
-    }
-
-    public function is_checksum_correct($checksum) {
-        return $this->calculate_checksum() === $checksum;
     }
 
     public function log($message, $level, $a = null, $depth = null, $display = false) {
